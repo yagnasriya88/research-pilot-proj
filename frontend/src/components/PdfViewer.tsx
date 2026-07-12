@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { Document, Page, pdfjs } from 'react-pdf'
 import 'react-pdf/dist/Page/AnnotationLayer.css'
 import 'react-pdf/dist/Page/TextLayer.css'
-import { ChevronLeft, ChevronRight, Sparkles } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Sparkles, ZoomIn, ZoomOut, ImagePlus, TextSelect } from 'lucide-react'
 import type { Highlight, HighlightColor, HighlightRect } from '../api/types'
+import { API_ORIGIN } from '../api/client'
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString()
 
@@ -23,12 +24,37 @@ const SWATCH_COLORS: Record<HighlightColor, string> = {
   pink: '#EC1A82',
 }
 
+const MIN_ZOOM = 0.5
+const MAX_ZOOM = 3
+const ZOOM_STEP = 0.25
+// How many pages beyond the current one stay mounted in each direction — a plain
+// buffer around `page` rather than a second IntersectionObserver, since `page` is
+// already tracked for the toolbar label and updates on every scroll settle.
+const RENDER_WINDOW = 3
+// Fallback aspect ratio (US Letter/A4-ish) for pages whose native size hasn't been
+// measured yet, so early placeholders aren't wildly wrong-sized before load.
+const FALLBACK_ASPECT = 792 / 612
+
 interface SelectionToolbarState {
   pageNumber: number
   left: number
   top: number
   quote: string
   rects: HighlightRect[]
+}
+
+interface ImageDragState {
+  pageNumber: number
+  startX: number
+  startY: number
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+export interface PdfViewerHandle {
+  scrollToPage: (page: number) => void
 }
 
 function findPageWrapper(node: Node | null): HTMLDivElement | null {
@@ -40,29 +66,37 @@ function findPageWrapper(node: Node | null): HTMLDivElement | null {
   return null
 }
 
-export function PdfViewer({
-  paperId,
-  page,
-  onPageChange,
-  existingHighlights,
-  onHighlight,
-  onAskAi,
-}: {
-  paperId: string
-  page: number
-  onPageChange: (page: number) => void
-  existingHighlights: Highlight[]
-  onHighlight: (highlight: { page: number; color: HighlightColor; rects: HighlightRect[]; quote: string }) => void
-  onAskAi: (excerpt: { quote: string; page: number }) => void
-}) {
+export const PdfViewer = forwardRef<
+  PdfViewerHandle,
+  {
+    sourceId: string
+    sourceType: 'paper' | 'book'
+    page: number
+    onPageChange: (page: number) => void
+    existingHighlights: Highlight[]
+    onHighlight: (highlight: { page: number; color: HighlightColor; rects: HighlightRect[]; quote: string }) => void
+    onAskAi: (excerpt: { quote: string; page: number }) => void
+    onImageAskAi: (excerpt: { imageDataUrl: string; page: number }) => void
+  }
+>(function PdfViewer(
+  { sourceId, sourceType, page, onPageChange, existingHighlights, onHighlight, onAskAi, onImageAskAi },
+  ref,
+) {
   const [numPages, setNumPages] = useState<number | null>(null)
   const [toolbar, setToolbar] = useState<SelectionToolbarState | null>(null)
+  const [zoom, setZoom] = useState(1)
+  const [mode, setMode] = useState<'text' | 'image'>('text')
+  const [imageDrag, setImageDrag] = useState<ImageDragState | null>(null)
+  const [pageDimensions, setPageDimensions] = useState<Map<number, { width: number; height: number }>>(new Map())
   const scrollRef = useRef<HTMLDivElement>(null)
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map())
+  const dragOriginRef = useRef<{ pageNumber: number; left: number; top: number } | null>(null)
 
   // Render at a fixed high resolution regardless of the display's actual pixel ratio,
   // so text/figures stay crisp even on standard (non-retina) monitors.
   const devicePixelRatio = useMemo(() => Math.max(window.devicePixelRatio || 1, 2.5), [])
+
+  useImperativeHandle(ref, () => ({ scrollToPage }))
 
   function clearToolbar() {
     setToolbar(null)
@@ -101,7 +135,37 @@ export function PdfViewer({
     pageRefs.current.get(clamped)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
+  function handleDocumentLoad(pdf: { numPages: number; getPage: (n: number) => Promise<{ getViewport: (o: { scale: number }) => { width: number; height: number } }> }) {
+    setNumPages(pdf.numPages)
+    for (let i = 1; i <= pdf.numPages; i++) {
+      pdf.getPage(i).then((p) => {
+        const vp = p.getViewport({ scale: 1 })
+        setPageDimensions((prev) => {
+          const next = new Map(prev)
+          next.set(i, { width: vp.width, height: vp.height })
+          return next
+        })
+      })
+    }
+  }
+
+  function adjustZoom(delta: number) {
+    setZoom((z) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.round((z + delta) * 100) / 100)))
+    clearToolbar()
+    setImageDrag(null)
+  }
+
+  function placeholderHeight(pageNumber: number): number {
+    const dims = pageDimensions.get(pageNumber) ?? pageDimensions.get(1)
+    const baseWidth = dims?.width ?? 612
+    const baseHeight = dims?.height ?? baseWidth * FALLBACK_ASPECT
+    // Approximate the rendered width the same way react-pdf would at this zoom —
+    // exact match isn't critical, this only sizes an off-screen placeholder.
+    return baseHeight * zoom
+  }
+
   function handleMouseUp() {
+    if (mode === 'image') return
     const selection = window.getSelection()
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
       setToolbar(null)
@@ -151,6 +215,77 @@ export function PdfViewer({
     clearToolbar()
   }
 
+  function handleImageMouseDown(e: MouseEvent<HTMLDivElement>) {
+    if (mode !== 'image') return
+    const wrapper = findPageWrapper(e.target as Node)
+    if (!wrapper) return
+    const rect = wrapper.getBoundingClientRect()
+    const x = e.clientX - rect.left
+    const y = e.clientY - rect.top
+    dragOriginRef.current = { pageNumber: Number(wrapper.dataset.pageNumber), left: rect.left, top: rect.top }
+    setImageDrag({ pageNumber: Number(wrapper.dataset.pageNumber), startX: x, startY: y, x, y, width: 0, height: 0 })
+  }
+
+  function handleImageMouseMove(e: MouseEvent<HTMLDivElement>) {
+    if (mode !== 'image' || !imageDrag || !dragOriginRef.current) return
+    const { left, top } = dragOriginRef.current
+    const x = e.clientX - left
+    const y = e.clientY - top
+    setImageDrag((prev) =>
+      prev
+        ? {
+            ...prev,
+            x: Math.min(prev.startX, x),
+            y: Math.min(prev.startY, y),
+            width: Math.abs(x - prev.startX),
+            height: Math.abs(y - prev.startY),
+          }
+        : prev,
+    )
+  }
+
+  function handleImageMouseUp() {
+    if (mode !== 'image' || !imageDrag) return
+    const { pageNumber, x, y, width, height } = imageDrag
+    dragOriginRef.current = null
+    if (width < 8 || height < 8) {
+      setImageDrag(null)
+      return
+    }
+    const wrapper = pageRefs.current.get(pageNumber)
+    const canvas = wrapper?.querySelector('canvas') as HTMLCanvasElement | null
+    if (!canvas) {
+      setImageDrag(null)
+      return
+    }
+    const scaleX = canvas.width / canvas.clientWidth
+    const scaleY = canvas.height / canvas.clientHeight
+    const crop = document.createElement('canvas')
+    crop.width = Math.round(width * scaleX)
+    crop.height = Math.round(height * scaleY)
+    const ctx = crop.getContext('2d')
+    if (ctx) {
+      ctx.drawImage(
+        canvas,
+        x * scaleX,
+        y * scaleY,
+        width * scaleX,
+        height * scaleY,
+        0,
+        0,
+        crop.width,
+        crop.height,
+      )
+      onImageAskAi({ imageDataUrl: crop.toDataURL('image/png'), page: pageNumber })
+    }
+    setImageDrag(null)
+  }
+
+  const pdfUrl =
+    sourceType === 'book'
+      ? `${API_ORIGIN}/api/books/${sourceId}/pdf`
+      : `${API_ORIGIN}/api/references/papers/${sourceId}/pdf`
+
   return (
     <div className="pdf-viewer">
       <div className="pdf-viewer-toolbar">
@@ -169,18 +304,63 @@ export function PdfViewer({
         >
           <ChevronRight size={14} />
         </button>
+
+        <span className="pdf-viewer-toolbar-divider" />
+
+        <button className="btn btn-icon-sm" disabled={zoom <= MIN_ZOOM} onClick={() => adjustZoom(-ZOOM_STEP)} title="Zoom out">
+          <ZoomOut size={14} />
+        </button>
+        <button
+          className="pdf-viewer-zoom-label"
+          onClick={() => {
+            setZoom(1)
+            clearToolbar()
+          }}
+          title="Reset zoom"
+        >
+          {Math.round(zoom * 100)}%
+        </button>
+        <button className="btn btn-icon-sm" disabled={zoom >= MAX_ZOOM} onClick={() => adjustZoom(ZOOM_STEP)} title="Zoom in">
+          <ZoomIn size={14} />
+        </button>
+
+        <span className="pdf-viewer-toolbar-divider" />
+
+        <button
+          className={`btn btn-icon-sm${mode === 'text' ? ' selected' : ''}`}
+          onClick={() => {
+            setMode('text')
+            setImageDrag(null)
+          }}
+          title="Select text"
+          aria-label="Select text"
+        >
+          <TextSelect size={14} />
+        </button>
+        <button
+          className={`btn btn-icon-sm${mode === 'image' ? ' selected' : ''}`}
+          onClick={() => {
+            setMode('image')
+            clearToolbar()
+          }}
+          title="Select image region"
+          aria-label="Select image region"
+        >
+          <ImagePlus size={14} />
+        </button>
       </div>
 
       <div className="pdf-viewer-scroll" ref={scrollRef} onScroll={clearToolbar}>
         <Document
-          file={`/api/references/papers/${paperId}/pdf`}
-          onLoadSuccess={({ numPages: n }) => setNumPages(n)}
+          file={pdfUrl}
+          onLoadSuccess={handleDocumentLoad}
           loading={<div className="empty-state">Loading PDF...</div>}
           error={<div className="empty-state">Couldn't load this PDF.</div>}
         >
           {numPages &&
             Array.from({ length: numPages }, (_, i) => i + 1).map((pageNumber) => {
               const pageHighlights = existingHighlights.filter((h) => h.page === pageNumber)
+              const inRenderWindow = Math.abs(pageNumber - page) <= RENDER_WINDOW
               return (
                 <div
                   key={pageNumber}
@@ -190,9 +370,14 @@ export function PdfViewer({
                     if (el) pageRefs.current.set(pageNumber, el)
                     else pageRefs.current.delete(pageNumber)
                   }}
-                  onMouseUp={handleMouseUp}
+                  style={!inRenderWindow ? { height: placeholderHeight(pageNumber) } : undefined}
+                  onMouseUp={mode === 'image' ? handleImageMouseUp : handleMouseUp}
+                  onMouseDown={mode === 'image' ? handleImageMouseDown : undefined}
+                  onMouseMove={mode === 'image' ? handleImageMouseMove : undefined}
                 >
-                  <Page pageNumber={pageNumber} renderAnnotationLayer={false} devicePixelRatio={devicePixelRatio} />
+                  {inRenderWindow ? (
+                    <Page pageNumber={pageNumber} scale={zoom} renderAnnotationLayer={false} devicePixelRatio={devicePixelRatio} />
+                  ) : null}
 
                   {pageHighlights.map((h) =>
                     h.rects.map((r, ri) => (
@@ -230,6 +415,13 @@ export function PdfViewer({
                       </button>
                     </div>
                   )}
+
+                  {imageDrag && imageDrag.pageNumber === pageNumber && (
+                    <div
+                      className="pdf-image-selection-box"
+                      style={{ left: imageDrag.x, top: imageDrag.y, width: imageDrag.width, height: imageDrag.height }}
+                    />
+                  )}
                 </div>
               )
             })}
@@ -237,4 +429,4 @@ export function PdfViewer({
       </div>
     </div>
   )
-}
+})

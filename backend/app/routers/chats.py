@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import settings
-from app.db.mongo import chats, folders, papers
+from app.db.mongo import books, chats, folders, papers
 from app.models.chat import (
     AddSourceRequest,
     ChatCreate,
@@ -14,12 +14,15 @@ from app.models.chat import (
     DeepResearchMode,
     DeepResearchScope,
     ExcerptRef,
+    ImageExcerptRef,
     MessageCreate,
     SearchScope,
 )
 from app.models.common import serialize_doc, utcnow
+from app.services.book_rag import build_book_local_context, run_book_chat, run_book_excerpt_chat
 from app.services.deep_research import run_openai_deep_research
 from app.services.deep_research import run_pipeline as run_deep_research_pipeline
+from app.services.media import save_image_base64
 from app.services.rag import (
     build_context,
     build_excerpt_context,
@@ -30,6 +33,7 @@ from app.services.rag import (
 from app.services.search_providers import run_search
 from app.services.search_summary import build_search_summary_messages
 from app.services.streaming import stream_chat_completion
+from app.services.vision_chat import build_image_messages
 
 router = APIRouter()
 
@@ -53,22 +57,34 @@ async def _folder_summaries(folder_ids: list[ObjectId]) -> list[dict]:
     return result
 
 
+async def _book_summary(book_id: ObjectId | None) -> dict | None:
+    if not book_id:
+        return None
+    doc = await books.find_one({"_id": book_id}, {"title": 1})
+    return {"id": str(book_id), "title": doc["title"]} if doc else None
+
+
 async def _sources_payload(chat_doc: dict) -> dict:
     return {
         "folders": await _folder_summaries(chat_doc.get("sourceFolderIds", [])),
         "papers": await _paper_titles(chat_doc.get("sourcePaperIds", [])),
+        "book": await _book_summary(chat_doc.get("sourceBookId")),
     }
 
 
 async def _build_and_insert_chat(body: ChatCreate) -> dict:
     source_folder_oids = [ObjectId(fid) for fid in body.sourceFolderIds]
     source_paper_oids = [ObjectId(pid) for pid in body.sourcePaperIds]
+    source_book_oid = ObjectId(body.sourceBookId) if body.sourceBookId else None
 
     title = body.title
     if not title:
         if body.type == ChatType.chat_with_pdf:
             papers_preview = await _paper_titles(source_paper_oids or source_folder_oids[:1])
             title = papers_preview[0]["title"] if papers_preview else "New Chat"
+        elif body.type == ChatType.chat_with_book and source_book_oid:
+            book_doc = await books.find_one({"_id": source_book_oid}, {"title": 1})
+            title = book_doc["title"] if book_doc else "New Chat"
         else:
             title = "New Chat"
 
@@ -78,6 +94,7 @@ async def _build_and_insert_chat(body: ChatCreate) -> dict:
         "title": title,
         "sourceFolderIds": source_folder_oids,
         "sourcePaperIds": source_paper_oids,
+        "sourceBookId": source_book_oid,
         "deepResearchScope": body.deepResearchScope.value if body.deepResearchScope else None,
         "deepResearchMode": body.deepResearchMode.value if body.deepResearchMode else None,
         "searchScope": body.searchScope.value if body.searchScope else None,
@@ -95,11 +112,25 @@ async def _build_and_insert_chat(body: ChatCreate) -> dict:
 async def create_chat(body: ChatCreate):
     if body.type == ChatType.chat_with_pdf and not body.sourceFolderIds and not body.sourcePaperIds:
         raise HTTPException(400, "At least one source folder or paper is required")
+    if body.type == ChatType.chat_with_book and not body.sourceBookId:
+        raise HTTPException(400, "A source book is required")
     if body.type == ChatType.deep_research:
         if body.deepResearchScope == DeepResearchScope.folder and not body.sourceFolderIds:
             raise HTTPException(400, "A folder is required for folder-scoped Deep Research")
 
     doc = await _build_and_insert_chat(body)
+    out = serialize_doc(doc)
+    out["sources"] = await _sources_payload(doc)
+    return out
+
+
+@router.get("/for-book/{book_id}")
+async def get_or_create_chat_for_book(book_id: str):
+    """Find-or-create the single-book `chat_with_book` chat for a given book — mirrors
+    `get_or_create_chat_for_paper` below.
+    """
+    existing = await chats.find_one({"type": ChatType.chat_with_book.value, "sourceBookId": ObjectId(book_id)})
+    doc = existing or await _build_and_insert_chat(ChatCreate(type=ChatType.chat_with_book, sourceBookId=book_id))
     out = serialize_doc(doc)
     out["sources"] = await _sources_payload(doc)
     return out
@@ -203,6 +234,53 @@ async def _stream_chat_with_pdf(
         yield event
 
 
+async def _stream_chat_with_book(
+    chat_doc: dict, content: str, history: list[dict], excerpt: ExcerptRef | None = None
+):
+    book_id = str(chat_doc["sourceBookId"])
+    event_stream = (
+        run_book_excerpt_chat(book_id, excerpt.page, excerpt.quote, content, history)
+        if excerpt is not None
+        else run_book_chat(book_id, content, history)
+    )
+    async for event in event_stream:
+        payload = json.loads(event[len("data: ") : -2])
+        if payload.get("done"):
+            await _append_message(chat_doc["_id"], {"role": "assistant", "content": payload["content"]})
+        yield event
+
+
+async def _stream_image_excerpt(chat_doc: dict, content: str, history: list[dict], page: int, image_base64: str):
+    """Shared by both `chat_with_pdf` and `chat_with_book` — the vision call itself
+    doesn't differ by source type, only which local-context helper builds the
+    surrounding text. Deliberately non-agentic (no `search_book`/cross-chapter reach)
+    per the confirmed v1 scope.
+    """
+    chat_type = chat_doc.get("type")
+    if chat_type == ChatType.chat_with_book.value:
+        book_id = str(chat_doc["sourceBookId"])
+        local_context, page_label = await build_book_local_context(book_id, page)
+        book_doc = await books.find_one({"_id": ObjectId(book_id)}, {"title": 1})
+        source_title = book_doc.get("title", "Untitled") if book_doc else "Untitled"
+    else:
+        source_paper_ids = chat_doc.get("sourcePaperIds", [])
+        paper_id = str(source_paper_ids[0]) if source_paper_ids else None
+        if paper_id:
+            local_context, page_label = await build_excerpt_context(paper_id, page)
+            paper_doc = await papers.find_one({"_id": ObjectId(paper_id)}, {"title": 1})
+            source_title = paper_doc.get("title", "Untitled") if paper_doc else "Untitled"
+        else:
+            local_context, page_label, source_title = "", f"p.{page}", "Untitled"
+
+    messages = build_image_messages(image_base64, local_context, page_label, source_title, history, content)
+
+    async for event in stream_chat_completion(messages):
+        payload = json.loads(event[len("data: ") : -2])
+        if payload.get("done"):
+            await _append_message(chat_doc["_id"], {"role": "assistant", "content": payload["content"]})
+        yield event
+
+
 async def _stream_search(chat_doc: dict, content: str):
     search_scope = chat_doc.get("searchScope")
     if search_scope == SearchScope.reference_manager.value:
@@ -286,11 +364,21 @@ async def send_message(chat_id: str, body: MessageCreate):
     user_message: dict = {"role": "user", "content": body.content}
     if body.excerpt:
         user_message["excerpt"] = body.excerpt.model_dump()
+    image_base64: str | None = None
+    if body.imageExcerpt:
+        # The raw base64 crop is only needed for the outgoing OpenAI vision call —
+        # never persisted to Mongo. The message stores a served file path instead,
+        # same reasoning as PDFs never being inlined into a document.
+        image_base64 = body.imageExcerpt.imageBase64
+        image_path = save_image_base64(image_base64)
+        user_message["imageExcerpt"] = {"page": body.imageExcerpt.page, "imagePath": image_path}
     await _append_message(chat_doc["_id"], user_message)
 
     chat_type = chat_doc.get("type", ChatType.chat_with_pdf.value)
 
-    if chat_type == ChatType.deep_research.value and is_first_message:
+    if body.imageExcerpt and image_base64:
+        event_stream = _stream_image_excerpt(chat_doc, body.content, history, body.imageExcerpt.page, image_base64)
+    elif chat_type == ChatType.deep_research.value and is_first_message:
         if chat_doc.get("deepResearchMode") == DeepResearchMode.openai.value:
             event_stream = run_openai_deep_research(chat_id, body.content)
         else:
@@ -302,6 +390,8 @@ async def send_message(chat_id: str, body: MessageCreate):
         event_stream = _stream_deep_research_followup(chat_doc, body.content, history)
     elif chat_type == ChatType.search.value:
         event_stream = _stream_search(chat_doc, body.content)
+    elif chat_type == ChatType.chat_with_book.value:
+        event_stream = _stream_chat_with_book(chat_doc, body.content, history, body.excerpt)
     else:
         event_stream = _stream_chat_with_pdf(chat_doc, body.content, history, body.excerpt)
 

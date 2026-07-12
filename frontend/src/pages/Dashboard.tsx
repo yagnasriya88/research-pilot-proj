@@ -42,6 +42,7 @@ const AGENTS: { type: ChatType; label: string; icon: LucideIcon; description: st
 
 const TYPE_LABEL: Record<ChatType, string> = {
   chat_with_pdf: 'Chat with PDF',
+  chat_with_book: 'Chat with Book',
   search: 'AI Search',
   deep_research: 'Deep Research',
 }

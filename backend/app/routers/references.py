@@ -26,6 +26,12 @@ from app.services.ingestion import (
 
 router = APIRouter()
 
+# Raw PDF bytes are served through a separate, unguarded router — react-pdf's <Document file={url}>
+# and plain <a href> download links can't attach an Authorization header, so these routes are
+# exempted from the auth guard (mounted without it in main.py). Paper IDs are unguessable Mongo
+# ObjectIds, matching the existing accepted tradeoff for the /api/chat-images static mount.
+public_router = APIRouter()
+
 
 # ---- Folders ----
 
@@ -147,7 +153,7 @@ async def delete_paper(paper_id: str):
     await papers.delete_one({"_id": ObjectId(paper_id)})
 
 
-@router.get("/papers/{paper_id}/pdf")
+@public_router.get("/papers/{paper_id}/pdf")
 async def get_paper_pdf(paper_id: str):
     doc = await papers.find_one({"_id": ObjectId(paper_id)})
     if not doc or not doc.get("pdfPath") or not Path(doc["pdfPath"]).is_file():

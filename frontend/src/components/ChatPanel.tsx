@@ -1,10 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 import { NotebookPen, Check, X, ArrowUp } from 'lucide-react'
 import { chatsApi } from '../api/chats'
-import type { Chat, ChatMessage, DeepResearchStage, ExcerptRef, MessageOutput } from '../api/types'
+import { API_ORIGIN } from '../api/client'
+import type { Chat, ChatMessage, DeepResearchStage, ExcerptRef, ImageExcerptRef, MessageOutput } from '../api/types'
 import { Markdown } from '../components/Markdown'
 import { SaveToNotebookModal } from '../components/SaveToNotebookModal'
 import { useToast } from '../toast/ToastContext'
+
+// A message's `imageExcerpt.imagePath` is either a live capture's own data URL (an
+// optimistic, not-yet-persisted local message) or a server-relative disk path already
+// persisted to Mongo (never raw base64, to avoid bloating chat documents) — resolve
+// either shape to something an <img> can load directly.
+function resolveImageUrl(imagePath: string): string {
+  if (imagePath.startsWith('data:')) return imagePath
+  const filename = imagePath.split(/[\\/]/).pop()
+  return `${API_ORIGIN}/api/chat-images/${filename}`
+}
 
 const QUICK_ACTIONS = [
   'Summarize the paper(s)',
@@ -30,6 +41,7 @@ export function ChatPanel({
   reloadSignal,
   initialMessage,
   askAiExcerpt,
+  askAiImageExcerpt,
   onChatChange,
   onOutput,
   onNoteSaved,
@@ -38,6 +50,7 @@ export function ChatPanel({
   reloadSignal?: number
   initialMessage?: string
   askAiExcerpt?: ExcerptRef | null
+  askAiImageExcerpt?: ImageExcerptRef | null
   onChatChange?: (chat: Chat) => void
   onOutput?: (output: MessageOutput | null) => void
   onNoteSaved?: (noteId: string, mode: 'append' | 'create') => void
@@ -50,6 +63,7 @@ export function ChatPanel({
   const [saveTarget, setSaveTarget] = useState<{ messageIdx: number; text: string } | null>(null)
   const [savedMessageIdx, setSavedMessageIdx] = useState<number | null>(null)
   const [pendingExcerpt, setPendingExcerpt] = useState<ExcerptRef | null>(null)
+  const [pendingImageExcerpt, setPendingImageExcerpt] = useState<ImageExcerptRef | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const sentInitialRef = useRef(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -69,13 +83,27 @@ export function ChatPanel({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat?.messages, streamingText, liveStages])
 
-  function send(content: string, excerpt?: ExcerptRef) {
+  function send(content: string, excerpt?: ExcerptRef, imageExcerpt?: ImageExcerptRef) {
     if (!content.trim() || pending) return
     setPending(true)
     setInput('')
     setChat((prev) =>
       prev
-        ? { ...prev, messages: [...prev.messages, { role: 'user', content, createdAt: new Date().toISOString(), excerpt }] }
+        ? {
+            ...prev,
+            messages: [
+              ...prev.messages,
+              {
+                role: 'user',
+                content,
+                createdAt: new Date().toISOString(),
+                excerpt,
+                imageExcerpt: imageExcerpt
+                  ? { page: imageExcerpt.page, imagePath: `data:image/png;base64,${imageExcerpt.imageBase64}` }
+                  : undefined,
+              },
+            ],
+          }
         : prev,
     )
     setStreamingText('')
@@ -126,6 +154,7 @@ export function ChatPanel({
         },
       },
       excerpt,
+      imageExcerpt,
     )
   }
 
@@ -139,6 +168,7 @@ export function ChatPanel({
 
   useEffect(() => {
     if (askAiExcerpt) {
+      setPendingImageExcerpt(null)
       setPendingExcerpt(askAiExcerpt)
       setInput('Explain this passage.')
       requestAnimationFrame(() => inputRef.current?.select())
@@ -146,9 +176,20 @@ export function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [askAiExcerpt])
 
+  useEffect(() => {
+    if (askAiImageExcerpt) {
+      setPendingExcerpt(null)
+      setPendingImageExcerpt(askAiImageExcerpt)
+      setInput('Explain this.')
+      requestAnimationFrame(() => inputRef.current?.select())
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [askAiImageExcerpt])
+
   function submitComposer() {
-    send(input, pendingExcerpt ?? undefined)
+    send(input, pendingExcerpt ?? undefined, pendingImageExcerpt ?? undefined)
     setPendingExcerpt(null)
+    setPendingImageExcerpt(null)
   }
 
   if (!chat) return <div className="empty-state" style={{ margin: 40 }}>Loading...</div>
@@ -159,6 +200,7 @@ export function ChatPanel({
         {chat.messages.length === 0 && !liveStages && (
           <div className="empty-state">
             {chat.type === 'chat_with_pdf' && 'Ask a question about the source paper(s).'}
+            {chat.type === 'chat_with_book' && 'Ask a question about this book.'}
             {chat.type === 'search' && 'Ask a research question to search papers.'}
             {chat.type === 'deep_research' && 'Describe the topic for your Deep Research Report.'}
           </div>
@@ -168,6 +210,12 @@ export function ChatPanel({
             {m.excerpt && (
               <div className="chat-bubble-excerpt">
                 "{m.excerpt.quote}" — p.{m.excerpt.page}
+              </div>
+            )}
+            {m.imageExcerpt && (
+              <div className="chat-bubble-image-excerpt">
+                <img src={resolveImageUrl(m.imageExcerpt.imagePath)} alt={`Selected region, p.${m.imageExcerpt.page}`} />
+                <span>p.{m.imageExcerpt.page}</span>
               </div>
             )}
             {m.role === 'assistant' ? <Markdown>{m.content}</Markdown> : m.content}
@@ -249,11 +297,20 @@ export function ChatPanel({
             </button>
           </div>
         )}
+        {pendingImageExcerpt && (
+          <div className="chat-pending-excerpt chat-pending-image-excerpt">
+            <img src={`data:image/png;base64,${pendingImageExcerpt.imageBase64}`} alt="Selected region" />
+            <span>Selected region — p.{pendingImageExcerpt.page}</span>
+            <button title="Remove selected image" onClick={() => setPendingImageExcerpt(null)}>
+              <X size={14} />
+            </button>
+          </div>
+        )}
         <div className="chat-input-row">
           <textarea
             ref={inputRef}
             placeholder={
-              pendingExcerpt
+              pendingExcerpt || pendingImageExcerpt
                 ? 'Ask a question about this passage...'
                 : chat.type === 'search'
                   ? 'Ask another research question...'

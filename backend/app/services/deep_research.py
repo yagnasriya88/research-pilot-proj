@@ -10,7 +10,12 @@ from app.config import settings
 from app.db.mongo import chats, paper_chunks, papers
 from app.models.chat import DeepResearchScope
 from app.models.common import utcnow
-from app.services.search_providers import NormalizedResult, dedupe_and_rank, run_search
+from app.services.search_providers import (
+    NormalizedResult,
+    ProviderStatus,
+    dedupe_and_rank,
+    run_search_with_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +66,41 @@ async def _stage_plan(query: str) -> list[str]:
     return [query] + [q for q in sub_queries if q and q != query]
 
 
-async def _stage_search_external(sub_queries: list[str], providers: list[str] | None = None) -> list[Candidate]:
+def _summarize_provider_statuses(all_statuses: list[list[ProviderStatus]]) -> str:
+    """Aggregates the per-sub-query ProviderStatus lists collected across a search stage into
+    one detail string, e.g. "arXiv: 12 match(es); Semantic Scholar: unavailable (timeout)".
+    A provider counts as unavailable if it failed on *any* sub-query call (a mid-run failure is
+    itself worth surfacing even if an earlier call succeeded); otherwise its match count is
+    summed across calls.
+    """
+    by_provider: dict[str, list[ProviderStatus]] = {}
+    for statuses in all_statuses:
+        for s in statuses:
+            by_provider.setdefault(s.name, []).append(s)
+
+    labels = {"arxiv": "arXiv", "semantic_scholar": "Semantic Scholar"}
+    parts = []
+    for name, statuses in by_provider.items():
+        label = labels.get(name, name)
+        failed = [s for s in statuses if not s.ok]
+        if failed:
+            parts.append(f"{label}: unavailable ({failed[0].error or 'error'})")
+        else:
+            parts.append(f"{label}: {sum(s.result_count for s in statuses)} match(es)")
+    return "; ".join(parts)
+
+
+async def _stage_search_external(
+    sub_queries: list[str], providers: list[str] | None = None
+) -> tuple[list[Candidate], str]:
     result_lists: list[list[NormalizedResult]] = []
+    all_statuses: list[list[ProviderStatus]] = []
     for sub_query in sub_queries:
-        result_lists.append(await run_search(sub_query, limit=10, providers=providers))
+        results, statuses = await run_search_with_status(sub_query, limit=10, providers=providers)
+        result_lists.append(results)
+        all_statuses.append(statuses)
     merged = dedupe_and_rank(*result_lists)
-    return [
+    candidates = [
         Candidate(
             title=r.title,
             authors=r.authors,
@@ -80,6 +114,7 @@ async def _stage_search_external(sub_queries: list[str], providers: list[str] | 
         )
         for r in merged
     ]
+    return candidates, _summarize_provider_statuses(all_statuses)
 
 
 async def _stage_load_folder(folder_id: str) -> list[Candidate]:
@@ -164,7 +199,8 @@ Research Gaps, Future Research, Conclusion, References.
 
 Cite papers inline using their bracketed number, e.g. [1], [3]. The References section must
 list every numbered paper with its title, authors, and year. Do not fabricate information
-beyond what's given."""
+beyond what's given. Always use $...$ for inline math and $$...$$ for display math. Never use
+\\( \\) or \\[ \\] delimiters."""
 
 
 async def _stage_synthesize(query: str, candidates: list[Candidate]) -> str:
@@ -209,6 +245,21 @@ async def _persist_final_report(chat_id: str, narration: str, markdown: str, ref
     return output
 
 
+def _no_candidates_report(query: str, scope: DeepResearchScope, detail_suffix: str) -> str:
+    if scope == DeepResearchScope.arxiv:
+        suggestion = 'Try switching to the "All Papers" scope, which also searches Semantic Scholar.'
+    elif scope == DeepResearchScope.folder:
+        suggestion = "Check that the selected folder actually contains papers, or try a broader scope."
+    else:
+        suggestion = "Try rephrasing your question with different terms."
+    reason = f" ({detail_suffix})" if detail_suffix else ""
+    return (
+        f"# No relevant papers found\n\n"
+        f"No candidate papers were found for **{query}** under the current scope{reason}.\n\n"
+        f"{suggestion}"
+    )
+
+
 async def run_pipeline(
     chat_id: str, query: str, scope: DeepResearchScope, folder_id: str | None
 ) -> AsyncGenerator[str, None]:
@@ -234,12 +285,25 @@ async def run_pipeline(
         yield await set_stage("plan", "done", f"{len(sub_queries)} search angle(s) identified")
 
         yield await set_stage("search", "running")
+        detail_suffix = ""
         if scope == DeepResearchScope.folder:
             candidates = await _stage_load_folder(folder_id) if folder_id else []
         else:
             providers = ["arxiv"] if scope == DeepResearchScope.arxiv else None
-            candidates = await _stage_search_external(sub_queries, providers=providers)
-        yield await set_stage("search", "done", f"{len(candidates)} candidate paper(s) found")
+            candidates, detail_suffix = await _stage_search_external(sub_queries, providers=providers)
+        search_detail = f"{len(candidates)} candidate paper(s) found"
+        if detail_suffix:
+            search_detail += f" — {detail_suffix}"
+        yield await set_stage("search", "done", search_detail)
+
+        if len(candidates) < settings.deep_research_min_candidates:
+            for name in ("screen", "extract", "synthesize"):
+                yield await set_stage(name, "done", "Skipped — no candidates found")
+            markdown = _no_candidates_report(query, scope, detail_suffix)
+            narration = "No relevant papers were found for this query."
+            output = await _persist_final_report(chat_id, narration, markdown, references=[])
+            yield _sse({"done": True, "content": narration, "output": output})
+            return
 
         yield await set_stage("screen", "running")
         candidates = await _stage_screen(query, candidates)
@@ -264,8 +328,15 @@ async def run_pipeline(
 
 QUERY_EXPANSION_SYSTEM_PROMPT = """You turn a user's research question into a detailed
 research brief for an autonomous web-research agent. Clarify the scope, list the key
-sub-questions a thorough answer should cover, and note any implicit constraints. Respond
-with the brief as plain text (no preamble, no JSON, no markdown headers) - it will be
+sub-questions a thorough answer should cover, and note any implicit constraints. The brief
+must explicitly instruct the agent to:
+- Prioritize peer-reviewed journal articles and recognized academic sources (e.g. PubMed,
+  Google Scholar, arXiv, JSTOR, university/research-institution publications) over blogs,
+  news articles, or general web content.
+- Cite every claim with its source, preferring primary research over secondary summaries.
+- Explicitly flag when no academic source was found for a sub-question, rather than silently
+  substituting a non-academic one.
+Respond with the brief as plain text (no preamble, no JSON, no markdown headers) - it will be
 passed directly to the research agent as its instructions."""
 
 

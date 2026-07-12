@@ -93,7 +93,10 @@ export function SourceScopeDropdown({ agent, value, onChange }: Props) {
                   <span className="dropdown-item-label">
                     <Package size={14} /> ArXiv
                   </span>
-                  <span className="dropdown-item-sub">Explore research preprints from arXiv</span>
+                  <span className="dropdown-item-sub">
+                    Explore research preprints from arXiv — strongest for CS, physics, math &amp;
+                    quantitative biology
+                  </span>
                 </div>
               </>
             )}

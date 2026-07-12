@@ -159,10 +159,20 @@ def chunk_pages(
 
 
 async def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batches requests at `settings.embedding_batch_size` texts per OpenAI call, so a
+    document with many chunks (e.g. a book) doesn't risk hitting the embeddings API's
+    per-request size limit. A paper's chunk count is normally well under one batch, so
+    this is a no-op extra loop iteration for the existing paper pipeline.
+    """
     if not texts:
         return []
-    response = await _openai.embeddings.create(model=settings.embedding_model, input=texts)
-    return [item.embedding for item in response.data]
+    embeddings: list[list[float]] = []
+    batch_size = settings.embedding_batch_size
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        response = await _openai.embeddings.create(model=settings.embedding_model, input=batch)
+        embeddings.extend(item.embedding for item in response.data)
+    return embeddings
 
 
 async def ingest_paper(paper_id: str, pdf_path: str) -> None:

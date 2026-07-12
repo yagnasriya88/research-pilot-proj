@@ -7,17 +7,20 @@ from app.db.mongo import VECTOR_INDEX_NAME, folders, paper_chunks, papers
 from app.services.ingestion import embed_texts
 from app.services.search_providers import NormalizedResult
 
-SYSTEM_PROMPT = """You are a research assistant helping a user understand academic papers.
+MATH_INSTRUCTION = """Always use $...$ for inline math and $$...$$ for display math. Never use
+\\( \\) or \\[ \\] delimiters."""
+
+SYSTEM_PROMPT = f"""You are a research assistant helping a user understand academic papers.
 Answer ONLY using the provided source excerpts below. Every factual claim must cite its
 source using the bracketed label shown with the excerpt, e.g. [Paper 1, p.3]. If the
 excerpts do not contain enough information to answer, say so explicitly rather than
-guessing or using outside knowledge."""
+guessing or using outside knowledge. {MATH_INSTRUCTION}"""
 
-EXCERPT_SYSTEM_PROMPT = """You are a research assistant helping a user understand a
+EXCERPT_SYSTEM_PROMPT = f"""You are a research assistant helping a user understand a
 specific passage they selected while reading a paper. Answer using the selected quote
 and the surrounding context from the same section of the paper. If the context is
 insufficient to answer, say so explicitly rather than guessing or using outside
-knowledge."""
+knowledge. {MATH_INSTRUCTION}"""
 
 
 @dataclass

@@ -24,6 +24,7 @@ import { useToast } from '../toast/ToastContext'
 
 const TYPE_LABEL: Record<Chat['type'], string> = {
   chat_with_pdf: 'Chat with PDF',
+  chat_with_book: 'Chat with Book',
   search: 'AI Search',
   deep_research: 'Deep Research Report',
 }
@@ -198,6 +199,22 @@ export function ChatThread() {
                       ))}
                     </>
                   )}
+                </div>
+              )}
+
+              {chat?.type === 'chat_with_book' && chat.sources.book && (
+                <div className="chat-sources">
+                  <div className="chat-sources-header">
+                    <span>Source</span>
+                  </div>
+                  <div className="source-card">
+                    <div className="source-card-title">
+                      <BookOpen size={13} /> {chat.sources.book.title}
+                    </div>
+                  </div>
+                  <button className="btn" style={{ width: '100%' }} onClick={() => navigate(`/books/${chat.sources.book!.id}/read`)}>
+                    <BookOpen size={14} /> Open Reader
+                  </button>
                 </div>
               )}
 

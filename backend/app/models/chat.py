@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 class ChatType(str, Enum):
     chat_with_pdf = "chat_with_pdf"
+    chat_with_book = "chat_with_book"
     search = "search"
     deep_research = "deep_research"
 
@@ -30,6 +31,7 @@ class ChatCreate(BaseModel):
     type: ChatType = ChatType.chat_with_pdf
     sourceFolderIds: list[str] = []
     sourcePaperIds: list[str] = []
+    sourceBookId: str | None = None
     title: str | None = None
     deepResearchScope: DeepResearchScope | None = None
     deepResearchMode: DeepResearchMode | None = None
@@ -37,14 +39,20 @@ class ChatCreate(BaseModel):
 
 
 class ExcerptRef(BaseModel):
-    paperId: str
+    paperId: str | None = None
     quote: str
     page: int
+
+
+class ImageExcerptRef(BaseModel):
+    page: int
+    imageBase64: str
 
 
 class MessageCreate(BaseModel):
     content: str
     excerpt: ExcerptRef | None = None
+    imageExcerpt: ImageExcerptRef | None = None
 
 
 class AddSourceRequest(BaseModel):

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
-import { LayoutGrid, Search, MessageCircle, FileText, Pencil, Trash2 } from 'lucide-react'
+import { LayoutGrid, Search, MessageCircle, FileText, Pencil, Trash2, BookMarked } from 'lucide-react'
 import { chatsApi } from '../api/chats'
 import type { ChatSummary, ChatType } from '../api/types'
 import { EmptyState } from '../components/EmptyState'
@@ -13,11 +13,13 @@ const FILTERS: { value: ChatType | 'all'; label: string; icon: LucideIcon }[] = 
   { value: 'all', label: 'All', icon: LayoutGrid },
   { value: 'search', label: 'AI Search', icon: Search },
   { value: 'chat_with_pdf', label: 'Chat with PDF', icon: MessageCircle },
+  { value: 'chat_with_book', label: 'Chat with Book', icon: BookMarked },
   { value: 'deep_research', label: 'Deep Research', icon: FileText },
 ]
 
 const TYPE_LABEL: Record<ChatType, string> = {
   chat_with_pdf: 'Chat with PDF',
+  chat_with_book: 'Chat with Book',
   search: 'AI Search',
   deep_research: 'Deep Research',
 }

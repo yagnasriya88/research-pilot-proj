@@ -1,5 +1,18 @@
 export type IngestionStatus = 'pending' | 'ready' | 'no_pdf' | 'failed'
 
+export interface User {
+  id: string
+  name: string
+  email: string
+  createdAt: string
+}
+
+export interface AuthResponse {
+  accessToken: string
+  tokenType: string
+  user: User
+}
+
 export interface Folder {
   id: string
   name: string
@@ -31,7 +44,7 @@ export interface Paper {
   createdAt: string
 }
 
-export type ChatType = 'chat_with_pdf' | 'search' | 'deep_research'
+export type ChatType = 'chat_with_pdf' | 'chat_with_book' | 'search' | 'deep_research'
 export type DeepResearchScope = 'external' | 'arxiv' | 'folder'
 export type DeepResearchMode = 'standard' | 'openai'
 export type SearchScope = 'all_papers' | 'arxiv' | 'reference_manager'
@@ -47,9 +60,15 @@ export interface ChatPaperRef {
   title: string
 }
 
+export interface ChatBookRef {
+  id: string
+  title: string
+}
+
 export interface ChatSources {
   folders: ChatFolderRef[]
   papers: ChatPaperRef[]
+  book: ChatBookRef | null
 }
 
 export interface SearchResult {
@@ -79,9 +98,19 @@ export type MessageOutput =
   | { kind: 'document'; markdown: string; references: ReportReference[] }
 
 export interface ExcerptRef {
-  paperId: string
+  paperId?: string
   quote: string
   page: number
+}
+
+export interface ImageExcerptRef {
+  page: number
+  imageBase64: string
+}
+
+export interface ImageExcerptMessage {
+  page: number
+  imagePath: string
 }
 
 export interface ChatMessage {
@@ -90,6 +119,7 @@ export interface ChatMessage {
   createdAt: string
   output?: MessageOutput
   excerpt?: ExcerptRef
+  imageExcerpt?: ImageExcerptMessage
 }
 
 export interface DeepResearchStage {
@@ -106,6 +136,7 @@ export interface Chat {
   title: string
   sourceFolderIds: string[]
   sourcePaperIds: string[]
+  sourceBookId: string | null
   deepResearchScope: DeepResearchScope | null
   deepResearchMode: DeepResearchMode | null
   searchScope: SearchScope | null
@@ -122,6 +153,7 @@ export interface ChatSummary {
   title: string
   sourceFolderIds: string[]
   sourcePaperIds: string[]
+  sourceBookId: string | null
   sources: ChatSources
   createdAt: string
   updatedAt: string
@@ -158,6 +190,26 @@ export interface NotebookSummary {
   id: string
   title: string
   snippet: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type BookIngestionStatus = 'pending' | 'processing' | 'ready' | 'failed'
+
+export interface TocEntry {
+  title: string
+  page: number
+  level: number
+}
+
+export interface Book {
+  id: string
+  title: string
+  author: string | null
+  pageCount: number | null
+  totalTokens: number | null
+  tableOfContents: TocEntry[]
+  ingestionStatus: BookIngestionStatus
   createdAt: string
   updatedAt: string
 }

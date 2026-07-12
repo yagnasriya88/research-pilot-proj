@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
 import { Link2, Globe, FileText, Upload, FilePen, BookOpen, Trash2, X, Menu } from 'lucide-react'
 import { referencesApi } from '../api/references'
+import { API_ORIGIN } from '../api/client'
 import type { Folder, Paper, Tag } from '../api/types'
 import { EmptyState } from '../components/EmptyState'
 
@@ -11,7 +12,8 @@ const TAG_COLORS = ['#f97316', '#22c55e', '#3b82f6', '#a855f7', '#ef4444', '#14b
 function paperSourceLink(p: Paper): { href: string; icon: LucideIcon; label: string } | null {
   if (p.doi) return { href: `https://doi.org/${p.doi}`, icon: Link2, label: 'View via DOI' }
   if (p.sourceUrl) return { href: p.sourceUrl, icon: Globe, label: 'View source' }
-  if (p.ingestionStatus === 'ready') return { href: `/api/references/papers/${p.id}/pdf`, icon: FileText, label: 'View stored PDF' }
+  if (p.ingestionStatus === 'ready')
+    return { href: `${API_ORIGIN}/api/references/papers/${p.id}/pdf`, icon: FileText, label: 'View stored PDF' }
   return null
 }
 

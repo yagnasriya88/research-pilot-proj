@@ -1,5 +1,5 @@
 import { fetchEventSource } from '@microsoft/fetch-event-source'
-import { api } from './client'
+import { api, API_ORIGIN, authHeaders } from './client'
 import type {
   Chat,
   ChatSummary,
@@ -7,6 +7,7 @@ import type {
   DeepResearchMode,
   DeepResearchScope,
   ExcerptRef,
+  ImageExcerptRef,
   MessageOutput,
   SearchScope,
 } from './types'
@@ -15,10 +16,12 @@ export const chatsApi = {
   list: (type?: ChatType) => api.get<ChatSummary[]>(`/chats${type ? `?type=${type}` : ''}`),
   get: (id: string) => api.get<Chat>(`/chats/${id}`),
   getForPaper: (paperId: string) => api.get<Chat>(`/chats/for-paper/${paperId}`),
+  getForBook: (bookId: string) => api.get<Chat>(`/chats/for-book/${bookId}`),
   create: (params: {
     type?: ChatType
     sourceFolderIds?: string[]
     sourcePaperIds?: string[]
+    sourceBookId?: string
     title?: string
     deepResearchScope?: DeepResearchScope
     deepResearchMode?: DeepResearchMode
@@ -40,12 +43,13 @@ export const chatsApi = {
       onError: (err: unknown) => void
     },
     excerpt?: ExcerptRef,
+    imageExcerpt?: ImageExcerptRef,
   ) => {
     const controller = new AbortController()
-    fetchEventSource(`/api/chats/${chatId}/messages`, {
+    fetchEventSource(`${API_ORIGIN}/api/chats/${chatId}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, excerpt }),
+      headers: { 'Content-Type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ content, excerpt, imageExcerpt }),
       signal: controller.signal,
       onmessage(ev) {
         const payload = JSON.parse(ev.data) as {
