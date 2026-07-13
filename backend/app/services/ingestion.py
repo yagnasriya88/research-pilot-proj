@@ -1,6 +1,4 @@
 import logging
-import os
-import uuid
 from collections import Counter
 from dataclasses import dataclass
 
@@ -34,22 +32,22 @@ class ChunkDraft:
     section_index: int | None = None
 
 
-def extract_pages(pdf_path: str) -> list[str]:
-    doc = fitz.open(pdf_path)
+def extract_pages(pdf_bytes: bytes) -> list[str]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         return [page.get_text() for page in doc]
     finally:
         doc.close()
 
 
-def detect_sections(pdf_path: str) -> list[tuple[str, int]]:
+def detect_sections(pdf_bytes: bytes) -> list[tuple[str, int]]:
     """Detect `(title, start_page)` breakpoints for a PDF's chapter/section structure,
     in document order. Tries the PDF's embedded outline (bookmarks) first; falls back
     to a font-size heuristic (headings render larger than surrounding body text) when
     no outline is present. Returns `[]` if neither source finds anything — callers
     should treat that as "no detectable structure" (a single implicit section).
     """
-    doc = fitz.open(pdf_path)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         toc = doc.get_toc(simple=True)
         if toc:
@@ -175,14 +173,14 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     return embeddings
 
 
-async def ingest_paper(paper_id: str, pdf_path: str) -> None:
+async def ingest_paper(paper_id: str, pdf_bytes: bytes) -> None:
     """Extract, chunk, embed, and store a paper's PDF. Updates ingestionStatus on
     success (`ready`) or failure (`failed`).
     """
     try:
-        pages = extract_pages(pdf_path)
+        pages = extract_pages(pdf_bytes)
         drafts = chunk_pages(pages)
-        assign_sections(drafts, detect_sections(pdf_path))
+        assign_sections(drafts, detect_sections(pdf_bytes))
         embeddings = await embed_texts([d.text for d in drafts])
 
         docs = [
@@ -219,15 +217,6 @@ async def ingest_paper(paper_id: str, pdf_path: str) -> None:
             {"_id": ObjectId(paper_id)},
             {"$set": {"ingestionStatus": IngestionStatus.failed.value}},
         )
-
-
-def save_pdf_bytes(content: bytes) -> str:
-    os.makedirs(settings.pdf_storage_dir, exist_ok=True)
-    filename = f"{uuid.uuid4().hex}.pdf"
-    path = os.path.join(settings.pdf_storage_dir, filename)
-    with open(path, "wb") as f:
-        f.write(content)
-    return path
 
 
 async def download_bytes(url: str) -> bytes | None:

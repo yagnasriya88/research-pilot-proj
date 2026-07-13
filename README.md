@@ -30,23 +30,27 @@ Research is slow work, and AI can remove the boring parts (searching, re-reading
 Built for a hackathon timeframe by keeping scope realistic:
 - One shared login-gated workspace, not a full multi-user system with permissions.
 - Core building blocks (PDF reading, chat, search) were built first, then reused across features instead of building each feature from scratch.
-- Heavier AI features (like open-web Deep Research) are opt-in, so the default flow stays fast and cheap to run.
+- Deep Research is explicitly its own separate agent type (not the default chat flow), so its extra cost/latency is opt-in per query, not something every chat pays for.
 
 ## Where the data comes from
 
 - **Papers and books** — uploaded by the user, or fetched live from public research APIs: **arXiv** and **Semantic Scholar**.
 - **Chat answers** — generated live by OpenAI's models, grounded in the actual text of the papers/books (not made up from memory).
-- **Deep Research reports** — built from live search results at the time of the question (standard mode) or from OpenAI's own live web-search agent (Deeper Search mode).
+- **Deep Research reports** — built live by OpenAI's own autonomous web-research agent at the time of the question.
 - No fixed offline dataset is used — everything is fetched or uploaded live, so results are always current.
 
 ## Agentic architecture
 
 ResearchPilot uses agents in two places:
 
-1. **Deep Research report** — a 5-step pipeline where each step has one clear job and passes its output to the next: **Plan** (turn the question into search queries) → **Search** (pull candidate papers) → **Screen** (keep only the relevant ones) → **Extract** (pull key facts from each paper) → **Synthesize** (write the final report with citations). If a search step finds too few real results, the pipeline stops early instead of forcing a fake answer — the "screen" step decides not to hand off. An opt-in "Deeper Search" mode hands the whole job to OpenAI's own autonomous web-research agent for open-web questions.
+1. **Deep Research report** — runs in one of two selectable modes (Standard by default, Deeper Search opt-in):
+   - **Standard** — a 5-stage pipeline (plan → search → screen → extract → synthesize) over arXiv and Semantic Scholar. To keep the report grounded in real paper content rather than just short abstracts, it enriches candidates with deeper context: papers from the user's own library get a real vector search against their full text, and external candidates get their actual PDF fetched and extracted where possible. Free and fast, with no external rate limits.
+   - **Deeper Search** — the question is first expanded into a detailed research brief, then handed to OpenAI's own autonomous web-research agent (`o4-mini-deep-research`), which plans its own searches, browses the web, and synthesizes a full cited report end to end — a single real run does 15-20+ sequential web searches before it's done. More thorough, but slower and subject to OpenAI's own rate limits.
+   
+   Both modes are instructed to answer strictly from peer-reviewed/academic sources, and both persist a real error message if generation fails rather than leaving the chat looking stuck.
 2. **Book chat** — instead of doing one fixed search, the AI is given a search tool and decides for itself when to use it. This means a question about one chapter can pull in facts from a different chapter automatically, without the user having to search manually.
 
-This split adds real value, not just complexity: each stage in Deep Research can be checked and debugged on its own, and the book agent gives better answers on long documents than a single fixed search ever could.
+This split adds real value, not just complexity: Deep Research offloads open-web planning/search/screening to a purpose-built research agent instead of reimplementing it, and the book agent gives better answers on long documents than a single fixed search ever could.
 
 ## How the user benefits
 
@@ -113,6 +117,7 @@ The frontend runs at `http://localhost:5173` and proxies `/api/*` to the backend
 
 - Login is a wall, not multi-tenancy — every logged-in user shares the same papers, chats,
   notebooks, and books.
-- PDFs and captured image crops are stored on local disk (`PDF_STORAGE_DIR`,
-  `IMAGE_STORAGE_DIR` in `.env`). See `deployment.md` for production deployment notes
-  (Vercel + Render) including the tradeoffs around persistent disk storage.
+- PDFs and captured image crops are stored in MongoDB via GridFS (`app/services/storage.py`),
+  not on local disk — this survives redeploys/restarts on hosts with an ephemeral filesystem
+  (e.g. Render's free/standard web services). See `deployment.md` for production deployment
+  notes (Vercel + Render).

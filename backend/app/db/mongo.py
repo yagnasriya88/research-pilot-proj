@@ -1,6 +1,6 @@
 import logging
 
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from pymongo.errors import OperationFailure
 
 from app.config import settings
@@ -9,6 +9,11 @@ logger = logging.getLogger(__name__)
 
 client = AsyncIOMotorClient(settings.mongodb_uri)
 db = client[settings.mongodb_db_name]
+
+# PDF/image bytes live in GridFS (not local disk) so they survive redeploys on hosts with
+# ephemeral filesystems (e.g. Render's free/standard web services) — see services/storage.py.
+pdf_files = AsyncIOMotorGridFSBucket(db, bucket_name="pdf_files")
+image_files = AsyncIOMotorGridFSBucket(db, bucket_name="image_files")
 
 papers = db["papers"]
 paper_chunks = db["paper_chunks"]

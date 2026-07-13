@@ -45,8 +45,6 @@ export interface Paper {
 }
 
 export type ChatType = 'chat_with_pdf' | 'chat_with_book' | 'search' | 'deep_research'
-export type DeepResearchScope = 'external' | 'arxiv' | 'folder'
-export type DeepResearchMode = 'standard' | 'openai'
 export type SearchScope = 'all_papers' | 'arxiv' | 'reference_manager'
 
 export interface ChatFolderRef {
@@ -110,7 +108,7 @@ export interface ImageExcerptRef {
 
 export interface ImageExcerptMessage {
   page: number
-  imagePath: string
+  imageFileId: string
 }
 
 export interface ChatMessage {
@@ -122,11 +120,14 @@ export interface ChatMessage {
   imageExcerpt?: ImageExcerptMessage
 }
 
+export type DeepResearchScope = 'external' | 'arxiv' | 'folder'
+export type DeepResearchMode = 'standard' | 'openai'
+
 export interface DeepResearchStage {
-  // 'plan'/'search'/'screen'/'extract'/'synthesize' for the standard pipeline;
-  // 'planning'/'research' for the OpenAI deep-research mode.
+  // 'plan'/'search'/'screen'/'extract'/'synthesize' (Standard mode) or 'planning'/'research'
+  // (Deeper Search/OpenAI mode).
   name: string
-  status: 'pending' | 'running' | 'done'
+  status: 'pending' | 'running' | 'done' | 'failed'
   detail?: string
 }
 

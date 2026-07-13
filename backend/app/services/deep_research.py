@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
@@ -10,6 +11,8 @@ from app.config import settings
 from app.db.mongo import chats, paper_chunks, papers
 from app.models.chat import DeepResearchScope
 from app.models.common import utcnow
+from app.services.ingestion import download_bytes, embed_texts, extract_pages
+from app.services.rag import _paper_vector_search
 from app.services.search_providers import (
     NormalizedResult,
     ProviderStatus,
@@ -20,6 +23,13 @@ from app.services.search_providers import (
 logger = logging.getLogger(__name__)
 
 _openai = AsyncOpenAI(api_key=settings.openai_api_key)
+
+# Beyond a plain abstract stub, a candidate's context can be enriched with real text (either a
+# paper-scoped vector-search hit for folder-sourced candidates, or extracted PDF text for
+# external ones) — this caps how much of that richer text reaches the extraction prompt so a
+# full pipeline run (up to `deep_research_screen_keep` candidates) still fits comfortably in
+# one LLM call.
+ENRICHED_CONTEXT_CHARS = 5000
 
 
 @dataclass
@@ -32,6 +42,7 @@ class Candidate:
     citationCount: int | None
     doi: str | None
     url: str | None
+    pdfUrl: str | None
     paperId: str | None  # set when sourced from the user's own library
     keyFindings: str = ""
     methodology: str = ""
@@ -44,6 +55,27 @@ def _sse(payload: dict) -> str:
 
 async def _persist_stage(chat_id: str, stages: list[dict]) -> None:
     await chats.update_one({"_id": ObjectId(chat_id)}, {"$set": {"deepResearchStages": stages}})
+
+
+async def _persist_final_report(chat_id: str, narration: str, markdown: str, references: list[dict]) -> dict:
+    output = {"kind": "document", "markdown": markdown, "references": references}
+    assistant_message = {"role": "assistant", "content": narration, "output": output}
+    await chats.update_one(
+        {"_id": ObjectId(chat_id)},
+        {"$push": {"messages": assistant_message}, "$set": {"updatedAt": utcnow()}},
+    )
+    return output
+
+
+async def _persist_error(chat_id: str, message: str) -> None:
+    """On failure, push a real assistant message instead of leaving the chat silently
+    stuck on its last "running" stage forever — a client that reconnects later (or polls,
+    since it has no live SSE connection to the original run) needs something to see.
+    """
+    await chats.update_one(
+        {"_id": ObjectId(chat_id)},
+        {"$push": {"messages": {"role": "assistant", "content": message}}, "$set": {"updatedAt": utcnow()}},
+    )
 
 
 async def _llm_json(system_prompt: str, user_content: str) -> dict:
@@ -110,6 +142,7 @@ async def _stage_search_external(
             citationCount=r.citationCount,
             doi=r.doi,
             url=r.url or r.pdfUrl,
+            pdfUrl=r.pdfUrl,
             paperId=None,
         )
         for r in merged
@@ -117,15 +150,26 @@ async def _stage_search_external(
     return candidates, _summarize_provider_statuses(all_statuses)
 
 
-async def _stage_load_folder(folder_id: str) -> list[Candidate]:
+async def _stage_load_folder(folder_id: str, query: str) -> list[Candidate]:
     docs = await papers.find({"folderId": ObjectId(folder_id)}).to_list(length=500)
+    query_embedding: list[float] | None = None
     candidates = []
     for doc in docs:
         abstract = doc.get("abstract")
         if not abstract and doc.get("ingestionStatus") == "ready":
-            first_chunk = await paper_chunks.find_one({"paperId": doc["_id"], "chunkIndex": 0})
-            if first_chunk:
-                abstract = first_chunk["text"][:1500]
+            try:
+                if query_embedding is None:
+                    [query_embedding] = await embed_texts([query])
+                chunks = await _paper_vector_search(doc["_id"], query_embedding, top_k=5)
+            except Exception:
+                logger.warning("Deep research folder vector search failed for paper %s", doc["_id"], exc_info=True)
+                chunks = []
+            if chunks:
+                abstract = "\n\n".join(c["text"] for c in chunks)[:ENRICHED_CONTEXT_CHARS]
+            else:
+                first_chunk = await paper_chunks.find_one({"paperId": doc["_id"], "chunkIndex": 0})
+                if first_chunk:
+                    abstract = first_chunk["text"][:1500]
         candidates.append(
             Candidate(
                 title=doc.get("title", "Untitled"),
@@ -136,13 +180,14 @@ async def _stage_load_folder(folder_id: str) -> list[Candidate]:
                 citationCount=doc.get("citationCount"),
                 doi=doc.get("doi"),
                 url=None,
+                pdfUrl=None,
                 paperId=str(doc["_id"]),
             )
         )
     return candidates
 
 
-def _numbered_listing(candidates: list[Candidate], abstract_chars: int = 600) -> str:
+def _numbered_listing(candidates: list[Candidate], abstract_chars: int = 4000) -> str:
     return "\n\n".join(
         f"[{i + 1}] {c.title} ({c.year or 'n.d.'}) - {c.citationCount or 0} citations\n"
         f"{c.abstract[:abstract_chars]}"
@@ -159,7 +204,7 @@ async def _stage_screen(query: str, candidates: list[Candidate]) -> list[Candida
             f'Given the research question and numbered candidates, pick the best '
             f"{settings.deep_research_screen_keep} to keep. Respond as JSON: "
             '{"keep": [<1-indexed numbers>]}.',
-            f"Question: {query}\n\nCandidates:\n\n{_numbered_listing(candidates)}",
+            f"Question: {query}\n\nCandidates:\n\n{_numbered_listing(candidates, abstract_chars=600)}",
         )
         keep_indices = [i - 1 for i in result.get("keep", []) if 0 < i <= len(candidates)]
         if keep_indices:
@@ -169,15 +214,39 @@ async def _stage_screen(query: str, candidates: list[Candidate]) -> list[Candida
     return candidates[: settings.deep_research_screen_keep]
 
 
+async def _fetch_external_full_text(candidate: Candidate) -> None:
+    """Best-effort: replace a candidate's short provider abstract with real extracted PDF
+    text when a PDF is actually fetchable. Never raises — any failure (no URL, network error,
+    non-PDF response, unparseable PDF) just leaves the existing abstract in place.
+    """
+    if not candidate.pdfUrl:
+        return
+    try:
+        pdf_bytes = await download_bytes(candidate.pdfUrl)
+        if not pdf_bytes:
+            return
+        pages = extract_pages(pdf_bytes)
+        text = "\n\n".join(pages).strip()
+        if text:
+            candidate.abstract = text[:ENRICHED_CONTEXT_CHARS]
+    except Exception:
+        logger.warning("Deep research full-text fetch failed for %s", candidate.pdfUrl, exc_info=True)
+
+
+async def _enrich_external_candidates(candidates: list[Candidate]) -> None:
+    await asyncio.gather(*(_fetch_external_full_text(c) for c in candidates if c.paperId is None))
+
+
 async def _stage_extract(query: str, candidates: list[Candidate]) -> list[Candidate]:
+    await _enrich_external_candidates(candidates)
     try:
         result = await _llm_json(
-            "You extract structured findings from paper abstracts for a research report. "
+            "You extract structured findings from paper excerpts for a research report. "
             "For each numbered paper, extract its key findings, methodology, and "
             'limitations (1-2 sentences each). Respond as JSON: {"papers": [{"index": '
             '<1-indexed>, "keyFindings": "...", "methodology": "...", "limitations": '
             '"..."}]}.',
-            f"Question: {query}\n\nPapers:\n\n{_numbered_listing(candidates, abstract_chars=1200)}",
+            f"Question: {query}\n\nPapers:\n\n{_numbered_listing(candidates)}",
         )
         by_index = {item["index"]: item for item in result.get("papers", [])}
         for i, candidate in enumerate(candidates):
@@ -235,16 +304,6 @@ def _references_list(candidates: list[Candidate]) -> list[dict]:
     ]
 
 
-async def _persist_final_report(chat_id: str, narration: str, markdown: str, references: list[dict]) -> dict:
-    output = {"kind": "document", "markdown": markdown, "references": references}
-    assistant_message = {"role": "assistant", "content": narration, "output": output}
-    await chats.update_one(
-        {"_id": ObjectId(chat_id)},
-        {"$push": {"messages": assistant_message}, "$set": {"updatedAt": utcnow()}},
-    )
-    return output
-
-
 def _no_candidates_report(query: str, scope: DeepResearchScope, detail_suffix: str) -> str:
     if scope == DeepResearchScope.arxiv:
         suggestion = 'Try switching to the "All Papers" scope, which also searches Semantic Scholar.'
@@ -279,6 +338,11 @@ async def run_pipeline(
         await _persist_stage(chat_id, stages)
         return _sse({"stage": name, "status": status, "detail": detail})
 
+    def fail_current_stage() -> None:
+        for s in stages:
+            if s["status"] == "running":
+                s["status"] = "failed"
+
     try:
         yield await set_stage("plan", "running")
         sub_queries = await _stage_plan(query)
@@ -287,7 +351,7 @@ async def run_pipeline(
         yield await set_stage("search", "running")
         detail_suffix = ""
         if scope == DeepResearchScope.folder:
-            candidates = await _stage_load_folder(folder_id) if folder_id else []
+            candidates = await _stage_load_folder(folder_id, query) if folder_id else []
         else:
             providers = ["arxiv"] if scope == DeepResearchScope.arxiv else None
             candidates, detail_suffix = await _stage_search_external(sub_queries, providers=providers)
@@ -309,7 +373,7 @@ async def run_pipeline(
         candidates = await _stage_screen(query, candidates)
         yield await set_stage("screen", "done", f"{len(candidates)} paper(s) kept")
 
-        yield await set_stage("extract", "running")
+        yield await set_stage("extract", "running", "Fetching full text & extracting findings…")
         candidates = await _stage_extract(query, candidates)
         yield await set_stage("extract", "done", "Findings extracted")
 
@@ -323,21 +387,51 @@ async def run_pipeline(
         yield _sse({"done": True, "content": narration, "output": output})
     except Exception:
         logger.exception("Deep research pipeline failed for chat %s", chat_id)
-        yield _sse({"error": "Report generation failed. Please try again."})
+        fail_current_stage()
+        await _persist_stage(chat_id, stages)
+        error_message = "Report generation failed. Please try again."
+        await _persist_error(chat_id, error_message)
+        yield _sse({"error": error_message})
 
 
-QUERY_EXPANSION_SYSTEM_PROMPT = """You turn a user's research question into a detailed
-research brief for an autonomous web-research agent. Clarify the scope, list the key
-sub-questions a thorough answer should cover, and note any implicit constraints. The brief
-must explicitly instruct the agent to:
-- Prioritize peer-reviewed journal articles and recognized academic sources (e.g. PubMed,
-  Google Scholar, arXiv, JSTOR, university/research-institution publications) over blogs,
-  news articles, or general web content.
-- Cite every claim with its source, preferring primary research over secondary summaries.
-- Explicitly flag when no academic source was found for a sub-question, rather than silently
-  substituting a non-academic one.
+QUERY_EXPANSION_SYSTEM_PROMPT = f"""You turn a user's research question into a detailed
+research brief for an autonomous research agent. Clarify the scope, list the key sub-questions
+a thorough answer should cover, and note any implicit constraints. The brief must explicitly
+instruct the agent to:
+- Only use peer-reviewed journal articles, conference papers, and recognized academic preprint
+  archives (e.g. arXiv, PubMed, IEEE Xplore, ACM Digital Library, Nature, Science, JSTOR,
+  Google Scholar, university/research-institution publications) as sources. Blogs, news
+  articles, marketing pages, and general web content must never be used or cited, even as
+  supporting context.
+- Cite every claim with its source paper, preferring primary research over secondary summaries
+  or review articles when possible.
+- Explicitly flag when no academic paper was found for a sub-question, rather than silently
+  substituting a non-academic source.
+- Use at most {settings.deep_research_openai_max_sources} total sources and stop searching once
+  that many strong sources are found, prioritizing the most relevant/highly-cited work over
+  exhaustive coverage.
 Respond with the brief as plain text (no preamble, no JSON, no markdown headers) - it will be
 passed directly to the research agent as its instructions."""
+
+
+DEEP_RESEARCH_INSTRUCTIONS = f"""You are a research assistant producing a Deep Research Report.
+
+Only use peer-reviewed journal articles, conference papers, and recognized academic preprint
+archives (e.g. arXiv, PubMed, IEEE Xplore, ACM Digital Library, Nature, Science, JSTOR, Google
+Scholar, university/research-institution publications) as sources. Never cite or rely on blogs,
+news articles, marketing pages, or general web content, even as supporting context — if no
+academic source exists for a sub-question, say so explicitly rather than substituting one.
+
+Use at most {settings.deep_research_openai_max_sources} total sources. Stop searching once you
+have that many strong, relevant sources rather than exhaustively continuing — prioritize
+quality and relevance over quantity of searches.
+
+Write the report in Markdown with these sections in order: Executive Summary, Introduction,
+Problem Definition, Background, Current State of Research, Comparison of Existing Methods,
+Advantages, Limitations, Research Gaps, Future Research, Conclusion, References. Cite papers
+inline using their bracketed reference number, e.g. [1], [3], and list every numbered source
+with its title, authors, year, and URL in the References section. Always use $...$ for inline
+math and $$...$$ for display math. Never use \\( \\) or \\[ \\] delimiters."""
 
 
 async def _expand_query_for_deep_research(query: str) -> str:
@@ -359,6 +453,11 @@ RESEARCH_STAGE_DETAIL = {
 
 
 def _openai_references_list(response) -> list[dict]:
+    """Derives the reference list from the `web_search_preview` tool's citation annotations —
+    `o4-mini-deep-research` does not support structured/JSON-schema output (confirmed via the
+    API: `text.format` of type `json_schema` is rejected for this model), so annotation
+    citations are the only mechanism available for getting real source URLs out of this model.
+    """
     seen_urls: set[str] = set()
     references: list[dict] = []
     for item in response.output:
@@ -382,7 +481,7 @@ def _openai_references_list(response) -> list[dict]:
     return references
 
 
-async def run_openai_deep_research(chat_id: str, query: str) -> AsyncGenerator[str, None]:
+async def run_deep_research(chat_id: str, query: str) -> AsyncGenerator[str, None]:
     stages = [
         {"name": "planning", "status": "pending"},
         {"name": "research", "status": "pending"},
@@ -396,6 +495,11 @@ async def run_openai_deep_research(chat_id: str, query: str) -> AsyncGenerator[s
         await _persist_stage(chat_id, stages)
         return _sse({"stage": name, "status": status, "detail": detail})
 
+    def fail_current_stage() -> None:
+        for s in stages:
+            if s["status"] == "running":
+                s["status"] = "failed"
+
     try:
         yield await set_stage("planning", "running", "Expanding your question into a research brief…")
         brief = await _expand_query_for_deep_research(query)
@@ -404,6 +508,7 @@ async def run_openai_deep_research(chat_id: str, query: str) -> AsyncGenerator[s
         yield await set_stage("research", "running", "Starting deep research…")
         stream = await _openai.responses.create(
             model=settings.deep_research_openai_model,
+            instructions=DEEP_RESEARCH_INSTRUCTIONS,
             input=brief,
             background=True,
             stream=True,
@@ -431,5 +536,9 @@ async def run_openai_deep_research(chat_id: str, query: str) -> AsyncGenerator[s
         output = await _persist_final_report(chat_id, narration, markdown, references)
         yield _sse({"done": True, "content": narration, "output": output})
     except Exception:
-        logger.exception("OpenAI deep research pipeline failed for chat %s", chat_id)
-        yield _sse({"error": "Report generation failed. Please try again."})
+        logger.exception("Deep research pipeline failed for chat %s", chat_id)
+        fail_current_stage()
+        await _persist_stage(chat_id, stages)
+        error_message = "Report generation failed. Please try again."
+        await _persist_error(chat_id, error_message)
+        yield _sse({"error": error_message})

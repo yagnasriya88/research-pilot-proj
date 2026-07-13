@@ -285,9 +285,14 @@ a {
 .sidebar-logo {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   font-weight: 600;
   padding: 8px 8px 20px;
+}
+
+.sidebar-logo-text {
+  font-size: var(--text-lg);
+  letter-spacing: -0.01em;
 }
 
 .sidebar-collapse-btn {
@@ -296,11 +301,13 @@ a {
 }
 
 .sidebar-logo .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-md);
+  background: linear-gradient(135deg, var(--orange-400) 0%, var(--color-accent-hover) 100%);
+  box-shadow: 0 2px 8px rgba(var(--color-accent-rgb), 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.3);
   display: inline-block;
+  flex-shrink: 0;
 }
 
 .sidebar-nav {
@@ -367,16 +374,27 @@ a {
   flex-shrink: 0;
 }
 
+.sidebar-footer-info {
+  min-width: 0;
+  flex: 1;
+}
+
 .sidebar-footer-name {
   font-size: 13px;
   font-weight: 600;
   line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .sidebar-footer-email {
   font-size: 11px;
   color: var(--text-muted);
   line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .app-main {
@@ -2644,17 +2662,19 @@ a.paper-row-title-link:hover .paper-row-title-icon {
 .auth-visual-brand {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   font-weight: 700;
-  font-size: var(--text-xl);
+  font-size: var(--text-3xl);
+  letter-spacing: -0.01em;
   margin-bottom: var(--space-10);
 }
 
 .auth-visual-brand .dot {
-  width: 10px;
-  height: 10px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   background: var(--color-text-on-accent);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.18);
   display: inline-block;
 }
 
@@ -2716,16 +2736,19 @@ a.paper-row-title-link:hover .paper-row-title-icon {
 .auth-card-brand {
   display: none;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   font-weight: 700;
+  font-size: var(--text-2xl);
+  letter-spacing: -0.01em;
   margin-bottom: var(--space-8);
 }
 
 .auth-card-brand .dot {
-  width: 8px;
-  height: 8px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: var(--color-accent);
+  box-shadow: 0 0 0 4px var(--color-accent-soft);
   display: inline-block;
 }
 

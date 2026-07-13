@@ -51,6 +51,7 @@ export const chatsApi = {
       headers: { 'Content-Type': 'application/json', ...authHeaders() },
       body: JSON.stringify({ content, excerpt, imageExcerpt }),
       signal: controller.signal,
+      openWhenHidden: true, // default behavior aborts+silently re-POSTs on tab visibility change
       onmessage(ev) {
         const payload = JSON.parse(ev.data) as {
           delta?: string

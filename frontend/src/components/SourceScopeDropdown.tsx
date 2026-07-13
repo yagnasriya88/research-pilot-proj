@@ -26,7 +26,7 @@ export function SourceScopeDropdown({ agent, value, onChange }: Props) {
 
   // Chat with PDF can only ever work over already-ingested papers — no external database choice.
   const showDatabases = agent !== 'chat_with_pdf'
-  // Deep Research only accepts a single whole folder as its scope (backend constraint).
+  // Deep Research (Standard mode) only accepts a single whole folder as its scope (backend constraint).
   const singleFolder = agent === 'deep_research'
 
   function referenceLabel(): string {

@@ -73,8 +73,8 @@ def _write_and_embed_nodes(docstore, nodes, leaf_nodes, embed_model, insert_batc
     )
 
 
-def _read_table_of_contents(pdf_path: str) -> list[dict]:
-    doc = fitz.open(pdf_path)
+def _read_table_of_contents(pdf_bytes: bytes) -> list[dict]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         toc = doc.get_toc(simple=True)
         return [{"title": title.strip(), "page": page, "level": level} for level, title, page in toc if title.strip()]
@@ -123,7 +123,7 @@ def _build_chapter_documents(book_id: str, pages: list[str], sections: list[tupl
     return documents
 
 
-async def ingest_book(book_id: str, pdf_path: str) -> None:
+async def ingest_book(book_id: str, pdf_bytes: bytes) -> None:
     """Extract, hierarchically chunk, embed, and index a book's PDF via LlamaIndex.
     Runs as a FastAPI background task (see routers/books.py), not inline with the
     upload request — book-scale ingestion is too slow to hold a request open for.
@@ -135,9 +135,9 @@ async def ingest_book(book_id: str, pdf_path: str) -> None:
             {"_id": ObjectId(book_id)}, {"$set": {"ingestionStatus": BookIngestionStatus.processing.value}}
         )
 
-        pages = extract_pages(pdf_path)
-        sections = detect_sections(pdf_path)
-        toc = _read_table_of_contents(pdf_path)
+        pages = extract_pages(pdf_bytes)
+        sections = detect_sections(pdf_bytes)
+        toc = _read_table_of_contents(pdf_bytes)
 
         documents = _build_chapter_documents(book_id, pages, sections)
 

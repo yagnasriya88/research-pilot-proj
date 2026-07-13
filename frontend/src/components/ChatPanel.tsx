@@ -7,14 +7,13 @@ import { Markdown } from '../components/Markdown'
 import { SaveToNotebookModal } from '../components/SaveToNotebookModal'
 import { useToast } from '../toast/ToastContext'
 
-// A message's `imageExcerpt.imagePath` is either a live capture's own data URL (an
-// optimistic, not-yet-persisted local message) or a server-relative disk path already
-// persisted to Mongo (never raw base64, to avoid bloating chat documents) — resolve
-// either shape to something an <img> can load directly.
-function resolveImageUrl(imagePath: string): string {
-  if (imagePath.startsWith('data:')) return imagePath
-  const filename = imagePath.split(/[\\/]/).pop()
-  return `${API_ORIGIN}/api/chat-images/${filename}`
+// A message's `imageExcerpt.imageFileId` is either a live capture's own data URL (an
+// optimistic, not-yet-persisted local message) or a GridFS file id already persisted to
+// Mongo (never raw base64, to avoid bloating chat documents) — resolve either shape to
+// something an <img> can load directly.
+function resolveImageUrl(imageFileId: string): string {
+  if (imageFileId.startsWith('data:')) return imageFileId
+  return `${API_ORIGIN}/api/chat-images/${imageFileId}`
 }
 
 const QUICK_ACTIONS = [
@@ -79,6 +78,25 @@ export function ChatPanel({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(load, [chatId, reloadSignal])
 
+  // Deep Research keeps running server-side even if the browser tab that started it is
+  // gone (see backend/app/routers/chats.py::_guarded_stream) — but there's no way to
+  // "reattach" to that original SSE stream from a different page load. If this mount
+  // didn't itself call send() (no local liveStages/streamingText), and the persisted chat
+  // shows a question still awaiting its answer, poll for updates instead of staying blank.
+  const lastMessage = chat?.messages[chat.messages.length - 1]
+  const awaitingDeepResearch = chat?.type === 'deep_research' && lastMessage?.role === 'user'
+  useEffect(() => {
+    if (!awaitingDeepResearch || liveStages || streamingText !== null || pending) return
+    const interval = setInterval(() => {
+      chatsApi.get(chatId).then((c) => {
+        setChat(c)
+        onChatChange?.(c)
+      })
+    }, 3000)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatId, awaitingDeepResearch, liveStages, streamingText, pending])
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat?.messages, streamingText, liveStages])
@@ -99,7 +117,7 @@ export function ChatPanel({
                 createdAt: new Date().toISOString(),
                 excerpt,
                 imageExcerpt: imageExcerpt
-                  ? { page: imageExcerpt.page, imagePath: `data:image/png;base64,${imageExcerpt.imageBase64}` }
+                  ? { page: imageExcerpt.page, imageFileId: `data:image/png;base64,${imageExcerpt.imageBase64}` }
                   : undefined,
               },
             ],
@@ -151,6 +169,7 @@ export function ChatPanel({
           setStreamingText(null)
           setLiveStages(null)
           setPending(false)
+          load()
         },
       },
       excerpt,
@@ -194,10 +213,14 @@ export function ChatPanel({
 
   if (!chat) return <div className="empty-state" style={{ margin: 40 }}>Loading...</div>
 
+  // liveStages (this page load's own SSE connection) takes priority; otherwise fall back to
+  // the persisted stages when we're polling a run that was started elsewhere (see above).
+  const displayStages = liveStages ?? (awaitingDeepResearch ? chat.deepResearchStages : null)
+
   return (
     <div className="chat-thread">
       <div className="chat-messages">
-        {chat.messages.length === 0 && !liveStages && (
+        {chat.messages.length === 0 && !displayStages && (
           <div className="empty-state">
             {chat.type === 'chat_with_pdf' && 'Ask a question about the source paper(s).'}
             {chat.type === 'chat_with_book' && 'Ask a question about this book.'}
@@ -214,7 +237,7 @@ export function ChatPanel({
             )}
             {m.imageExcerpt && (
               <div className="chat-bubble-image-excerpt">
-                <img src={resolveImageUrl(m.imageExcerpt.imagePath)} alt={`Selected region, p.${m.imageExcerpt.page}`} />
+                <img src={resolveImageUrl(m.imageExcerpt.imageFileId)} alt={`Selected region, p.${m.imageExcerpt.page}`} />
                 <span>p.{m.imageExcerpt.page}</span>
               </div>
             )}
@@ -244,14 +267,14 @@ export function ChatPanel({
             )}
           </div>
         ))}
-        {liveStages && (
+        {displayStages && (
           <div className="chat-bubble assistant">
             <div className="dr-stages">
-              {liveStages.map((s, idx) => (
+              {displayStages.map((s, idx) => (
                 <div key={s.name} className={`dr-stage dr-stage--${s.status}`}>
                   <div className="dr-stage-rail">
                     <span className="dr-stage-icon">{s.status === 'done' && <Check size={9} strokeWidth={3} />}</span>
-                    {idx < liveStages.length - 1 && <span className="dr-stage-line" />}
+                    {idx < displayStages.length - 1 && <span className="dr-stage-line" />}
                   </div>
                   <div className="dr-stage-text">
                     <span className="dr-stage-label">{STAGE_LABEL[s.name]}</span>

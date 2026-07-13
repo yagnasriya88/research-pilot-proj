@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from bson import ObjectId
@@ -20,7 +21,7 @@ from app.models.chat import (
 )
 from app.models.common import serialize_doc, utcnow
 from app.services.book_rag import build_book_local_context, run_book_chat, run_book_excerpt_chat
-from app.services.deep_research import run_openai_deep_research
+from app.services.deep_research import run_deep_research
 from app.services.deep_research import run_pipeline as run_deep_research_pipeline
 from app.services.media import save_image_base64
 from app.services.rag import (
@@ -36,6 +37,40 @@ from app.services.streaming import stream_chat_completion
 from app.services.vision_chat import build_image_messages
 
 router = APIRouter()
+
+# Guards against duplicate concurrent runs for the same chat (e.g. a client re-POSTing the
+# same message after an SSE reconnect) — single-process demo app, so an in-memory set is
+# sufficient; no distributed locking needed.
+_in_flight_chats: set[str] = set()
+
+
+async def _guarded_stream(chat_id: str, event_stream):
+    """Relays `event_stream`'s SSE events to whichever client is currently connected, but
+    runs the actual work (`_drive`) as an independent `asyncio.Task` rather than awaiting
+    `event_stream` directly in this generator. This matters because Starlette's
+    `StreamingResponse` cancels the response body generator when the client disconnects
+    (e.g. the user navigates away or closes the tab) — without this decoupling, a
+    long-running Deep Research call would be killed mid-run instead of finishing and
+    persisting its result. `_drive` keeps running (and keeps writing progress/results to
+    Mongo) regardless of whether anyone is still listening on `queue`.
+    """
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _drive() -> None:
+        try:
+            async for event in event_stream:
+                await queue.put(event)
+        finally:
+            await queue.put(None)
+            _in_flight_chats.discard(chat_id)
+
+    asyncio.create_task(_drive())
+
+    while True:
+        event = await queue.get()
+        if event is None:
+            return
+        yield event
 
 
 async def _paper_titles(paper_ids: list[ObjectId]) -> list[dict]:
@@ -114,9 +149,12 @@ async def create_chat(body: ChatCreate):
         raise HTTPException(400, "At least one source folder or paper is required")
     if body.type == ChatType.chat_with_book and not body.sourceBookId:
         raise HTTPException(400, "A source book is required")
-    if body.type == ChatType.deep_research:
-        if body.deepResearchScope == DeepResearchScope.folder and not body.sourceFolderIds:
-            raise HTTPException(400, "A folder is required for folder-scoped Deep Research")
+    if (
+        body.type == ChatType.deep_research
+        and body.deepResearchScope == DeepResearchScope.folder
+        and not body.sourceFolderIds
+    ):
+        raise HTTPException(400, "A source folder is required for folder-scoped Deep Research")
 
     doc = await _build_and_insert_chat(body)
     out = serialize_doc(doc)
@@ -355,44 +393,51 @@ async def _append_message(chat_id: ObjectId, message: dict) -> None:
 
 @router.post("/{chat_id}/messages")
 async def send_message(chat_id: str, body: MessageCreate):
-    chat_doc = await chats.find_one({"_id": ObjectId(chat_id)})
-    if not chat_doc:
-        raise HTTPException(404, "Chat not found")
+    if chat_id in _in_flight_chats:
+        raise HTTPException(409, "A response is already being generated for this chat")
+    _in_flight_chats.add(chat_id)
 
-    history = chat_doc.get("messages", [])
-    is_first_message = len(history) == 0
-    user_message: dict = {"role": "user", "content": body.content}
-    if body.excerpt:
-        user_message["excerpt"] = body.excerpt.model_dump()
-    image_base64: str | None = None
-    if body.imageExcerpt:
-        # The raw base64 crop is only needed for the outgoing OpenAI vision call —
-        # never persisted to Mongo. The message stores a served file path instead,
-        # same reasoning as PDFs never being inlined into a document.
-        image_base64 = body.imageExcerpt.imageBase64
-        image_path = save_image_base64(image_base64)
-        user_message["imageExcerpt"] = {"page": body.imageExcerpt.page, "imagePath": image_path}
-    await _append_message(chat_doc["_id"], user_message)
+    try:
+        chat_doc = await chats.find_one({"_id": ObjectId(chat_id)})
+        if not chat_doc:
+            raise HTTPException(404, "Chat not found")
 
-    chat_type = chat_doc.get("type", ChatType.chat_with_pdf.value)
+        history = chat_doc.get("messages", [])
+        is_first_message = len(history) == 0
+        user_message: dict = {"role": "user", "content": body.content}
+        if body.excerpt:
+            user_message["excerpt"] = body.excerpt.model_dump()
+        image_base64: str | None = None
+        if body.imageExcerpt:
+            # The raw base64 crop is only needed for the outgoing OpenAI vision call —
+            # never persisted to Mongo. The message stores a served file path instead,
+            # same reasoning as PDFs never being inlined into a document.
+            image_base64 = body.imageExcerpt.imageBase64
+            image_file_id = await save_image_base64(image_base64)
+            user_message["imageExcerpt"] = {"page": body.imageExcerpt.page, "imageFileId": image_file_id}
+        await _append_message(chat_doc["_id"], user_message)
 
-    if body.imageExcerpt and image_base64:
-        event_stream = _stream_image_excerpt(chat_doc, body.content, history, body.imageExcerpt.page, image_base64)
-    elif chat_type == ChatType.deep_research.value and is_first_message:
-        if chat_doc.get("deepResearchMode") == DeepResearchMode.openai.value:
-            event_stream = run_openai_deep_research(chat_id, body.content)
+        chat_type = chat_doc.get("type", ChatType.chat_with_pdf.value)
+
+        if body.imageExcerpt and image_base64:
+            event_stream = _stream_image_excerpt(chat_doc, body.content, history, body.imageExcerpt.page, image_base64)
+        elif chat_type == ChatType.deep_research.value and is_first_message:
+            if chat_doc.get("deepResearchMode") == DeepResearchMode.openai.value:
+                event_stream = run_deep_research(chat_id, body.content)
+            else:
+                scope = DeepResearchScope(chat_doc["deepResearchScope"])
+                folder_id = str(chat_doc["sourceFolderIds"][0]) if chat_doc.get("sourceFolderIds") else None
+                event_stream = run_deep_research_pipeline(chat_id, body.content, scope, folder_id)
+        elif chat_type == ChatType.deep_research.value:
+            event_stream = _stream_deep_research_followup(chat_doc, body.content, history)
+        elif chat_type == ChatType.search.value:
+            event_stream = _stream_search(chat_doc, body.content)
+        elif chat_type == ChatType.chat_with_book.value:
+            event_stream = _stream_chat_with_book(chat_doc, body.content, history, body.excerpt)
         else:
-            scope = DeepResearchScope(chat_doc["deepResearchScope"])
-            folder_ids = chat_doc.get("sourceFolderIds", [])
-            folder_id = str(folder_ids[0]) if folder_ids else None
-            event_stream = run_deep_research_pipeline(chat_id, body.content, scope, folder_id)
-    elif chat_type == ChatType.deep_research.value:
-        event_stream = _stream_deep_research_followup(chat_doc, body.content, history)
-    elif chat_type == ChatType.search.value:
-        event_stream = _stream_search(chat_doc, body.content)
-    elif chat_type == ChatType.chat_with_book.value:
-        event_stream = _stream_chat_with_book(chat_doc, body.content, history, body.excerpt)
-    else:
-        event_stream = _stream_chat_with_pdf(chat_doc, body.content, history, body.excerpt)
+            event_stream = _stream_chat_with_pdf(chat_doc, body.content, history, body.excerpt)
+    except Exception:
+        _in_flight_chats.discard(chat_id)
+        raise
 
-    return StreamingResponse(event_stream, media_type="text/event-stream")
+    return StreamingResponse(_guarded_stream(chat_id, event_stream), media_type="text/event-stream")

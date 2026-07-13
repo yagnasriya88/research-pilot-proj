@@ -1,15 +1,12 @@
-from pathlib import Path
-
 import fitz  # PyMuPDF
 from bson import ObjectId
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
 
 from app.db.mongo import book_chunks, book_highlights, books
 from app.models.book import BookHighlightCreate, BookIngestionStatus, BookUpdate
 from app.models.common import serialize_doc, utcnow
 from app.services.book_index import ingest_book
-from app.services.ingestion import save_pdf_bytes
+from app.services.storage import delete_pdf, stream_pdf_response, upload_pdf
 
 router = APIRouter()
 
@@ -17,9 +14,9 @@ router = APIRouter()
 public_router = APIRouter()
 
 
-def _extract_title_author(pdf_path: str, filename: str | None) -> tuple[str, str | None]:
+def _extract_title_author(pdf_bytes: bytes, filename: str | None) -> tuple[str, str | None]:
     try:
-        doc = fitz.open(pdf_path)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
             meta = doc.metadata or {}
         finally:
@@ -34,13 +31,13 @@ def _extract_title_author(pdf_path: str, filename: str | None) -> tuple[str, str
 @router.post("/upload", status_code=201)
 async def upload_book(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     content = await file.read()
-    pdf_path = save_pdf_bytes(content)
-    title, author = _extract_title_author(pdf_path, file.filename)
+    pdf_file_id = await upload_pdf(content)
+    title, author = _extract_title_author(content, file.filename)
 
     doc = {
         "title": title,
         "author": author,
-        "pdfPath": pdf_path,
+        "pdfFileId": pdf_file_id,
         "pageCount": None,
         "totalTokens": None,
         "tableOfContents": [],
@@ -51,7 +48,7 @@ async def upload_book(background_tasks: BackgroundTasks, file: UploadFile = File
     result = await books.insert_one(doc)
     book_id = str(result.inserted_id)
 
-    background_tasks.add_task(ingest_book, book_id, pdf_path)
+    background_tasks.add_task(ingest_book, book_id, content)
 
     doc["_id"] = result.inserted_id
     return serialize_doc(doc)
@@ -93,16 +90,16 @@ async def delete_book(book_id: str):
     # delete path.
     await book_highlights.delete_many({"bookId": ObjectId(book_id)})
     await books.delete_one({"_id": ObjectId(book_id)})
-    if doc and doc.get("pdfPath") and Path(doc["pdfPath"]).is_file():
-        Path(doc["pdfPath"]).unlink(missing_ok=True)
+    if doc:
+        await delete_pdf(doc.get("pdfFileId"))
 
 
 @public_router.get("/{book_id}/pdf")
 async def get_book_pdf(book_id: str):
     doc = await books.find_one({"_id": ObjectId(book_id)})
-    if not doc or not doc.get("pdfPath") or not Path(doc["pdfPath"]).is_file():
-        raise HTTPException(404, "No stored PDF for this book")
-    return FileResponse(doc["pdfPath"], media_type="application/pdf")
+    if not doc:
+        raise HTTPException(404, "Book not found")
+    return await stream_pdf_response(doc.get("pdfFileId"))
 
 
 @router.post("/{book_id}/highlights", status_code=201)

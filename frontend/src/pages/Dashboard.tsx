@@ -33,6 +33,7 @@ import { referencesApi } from '../api/references'
 import type { ChatSummary, ChatType, DeepResearchMode, NotebookSummary } from '../api/types'
 import { SourceScopeDropdown, type SourceScopeValue } from '../components/SourceScopeDropdown'
 import { EmptyState } from '../components/EmptyState'
+import { useAuth } from '../auth/AuthContext'
 
 const AGENTS: { type: ChatType; label: string; icon: LucideIcon; description: string }[] = [
   { type: 'search', label: 'AI Search', icon: Search, description: 'Search papers and get cited answers.' },
@@ -157,6 +158,8 @@ const DEEP_RESEARCH_SUGGESTIONS: { icon: LucideIcon; title: string; question: st
 
 export function Dashboard() {
   const navigate = useNavigate()
+  const { user } = useAuth()
+  const firstName = user?.name?.trim().split(/\s+/)[0]
   const [searchParams] = useSearchParams()
   const initialAgent = (searchParams.get('agent') as ChatType | null) ?? 'search'
   const [agent, setAgent] = useState<ChatType>(initialAgent)
@@ -184,7 +187,8 @@ export function Dashboard() {
     }
   }, [agent, sourceScope])
 
-  // Deep Research only accepts a single whole folder — drop an incompatible multi-paper/folder selection.
+  // Deep Research (Standard mode) only accepts a single whole folder — drop an incompatible
+  // multi-paper/folder selection.
   useEffect(() => {
     if (
       agent === 'deep_research' &&
@@ -215,7 +219,7 @@ export function Dashboard() {
       const chat = await chatsApi.create({
         type: agent,
         sourceFolderIds: isRefScope ? sourceScope.folderIds : [],
-        sourcePaperIds: isRefScope ? sourceScope.paperIds : [],
+        sourcePaperIds: agent !== 'deep_research' && isRefScope ? sourceScope.paperIds : [],
         title: question.slice(0, 80),
         deepResearchScope: agent === 'deep_research' ? deepResearchScope : undefined,
         deepResearchMode: agent === 'deep_research' ? deepResearchMode : undefined,
@@ -241,7 +245,9 @@ export function Dashboard() {
 
   return (
     <div className="dashboard">
-      <h1 className="dashboard-heading serif">Hello Johnson, what would you like to research today?</h1>
+      <h1 className="dashboard-heading serif">
+        Hello{firstName ? ` ${firstName}` : ''}, what would you like to research today?
+      </h1>
 
       <div className="ask-box">
         <textarea

@@ -1,8 +1,5 @@
-from pathlib import Path
-
 from bson import ObjectId
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
 
 from app.db.mongo import folders, highlights, papers, tags
 from app.models.common import serialize_doc, utcnow
@@ -20,9 +17,9 @@ from app.services.ingestion import (
     fetch_crossref_metadata,
     find_oa_pdf_url,
     ingest_paper,
-    save_pdf_bytes,
     download_bytes,
 )
+from app.services.storage import stream_pdf_response, upload_pdf
 
 router = APIRouter()
 
@@ -156,9 +153,9 @@ async def delete_paper(paper_id: str):
 @public_router.get("/papers/{paper_id}/pdf")
 async def get_paper_pdf(paper_id: str):
     doc = await papers.find_one({"_id": ObjectId(paper_id)})
-    if not doc or not doc.get("pdfPath") or not Path(doc["pdfPath"]).is_file():
-        raise HTTPException(404, "No stored PDF for this paper")
-    return FileResponse(doc["pdfPath"], media_type="application/pdf")
+    if not doc:
+        raise HTTPException(404, "Paper not found")
+    return await stream_pdf_response(doc.get("pdfFileId"))
 
 
 @router.post("/papers/{paper_id}/highlights", status_code=201)
@@ -204,7 +201,7 @@ async def _create_paper_stub(
         "tagIds": [],
         "type": "Journal Article",
         "source": source.value,
-        "pdfPath": None,
+        "pdfFileId": None,
         "ingestionStatus": IngestionStatus.pending.value,
         "createdAt": utcnow(),
     }
@@ -229,9 +226,9 @@ async def upload_file(
         folder_id=folderId,
         source=PaperSource.upload,
     )
-    pdf_path = save_pdf_bytes(content)
-    await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfPath": pdf_path}})
-    await ingest_paper(paper_id, pdf_path)
+    pdf_file_id = await upload_pdf(content)
+    await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfFileId": pdf_file_id}})
+    await ingest_paper(paper_id, content)
     doc = await papers.find_one({"_id": ObjectId(paper_id)})
     return serialize_doc(doc)
 
@@ -269,9 +266,9 @@ async def upload_url(body: UrlPaperCreate):
     )
 
     if pdf_bytes:
-        pdf_path = save_pdf_bytes(pdf_bytes)
-        await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfPath": pdf_path}})
-        await ingest_paper(paper_id, pdf_path)
+        pdf_file_id = await upload_pdf(pdf_bytes)
+        await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfFileId": pdf_file_id}})
+        await ingest_paper(paper_id, pdf_bytes)
     else:
         await papers.update_one(
             {"_id": ObjectId(paper_id)}, {"$set": {"ingestionStatus": IngestionStatus.no_pdf.value}}
@@ -321,9 +318,9 @@ async def add_from_search(body: FromSearchPaperCreate):
 
     pdf_bytes = await download_bytes(body.pdfUrl) if body.pdfUrl else None
     if pdf_bytes:
-        pdf_path = save_pdf_bytes(pdf_bytes)
-        await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfPath": pdf_path}})
-        await ingest_paper(paper_id, pdf_path)
+        pdf_file_id = await upload_pdf(pdf_bytes)
+        await papers.update_one({"_id": ObjectId(paper_id)}, {"$set": {"pdfFileId": pdf_file_id}})
+        await ingest_paper(paper_id, pdf_bytes)
     else:
         await papers.update_one(
             {"_id": ObjectId(paper_id)}, {"$set": {"ingestionStatus": IngestionStatus.no_pdf.value}}

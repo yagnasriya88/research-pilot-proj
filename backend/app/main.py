@@ -1,14 +1,13 @@
-import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.db.mongo import ensure_indexes
 from app.routers import auth, books, chats, notebooks, references
 from app.services.auth import get_current_user
+from app.services.storage import stream_image_response
 
 
 @asynccontextmanager
@@ -40,8 +39,11 @@ app.include_router(chats.router, prefix="/api/chats", tags=["chats"], dependenci
 app.include_router(notebooks.router, prefix="/api/notebooks", tags=["notebooks"], dependencies=_auth_guard)
 app.include_router(books.router, prefix="/api/books", tags=["books"], dependencies=_auth_guard)
 
-os.makedirs(settings.image_storage_dir, exist_ok=True)
-app.mount("/api/chat-images", StaticFiles(directory=settings.image_storage_dir), name="chat-images")
+@app.get("/api/chat-images/{file_id}")
+async def get_chat_image(file_id: str):
+    """Unguarded, same rationale as references.py::public_router — an <img src> can't
+    attach an Authorization header, and GridFS file ids are unguessable ObjectIds."""
+    return await stream_image_response(file_id)
 
 
 @app.get("/api/health")
